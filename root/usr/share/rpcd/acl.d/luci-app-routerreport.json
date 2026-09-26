@@ -1,0 +1,11 @@
+{
+	"luci-app-routerreport": {
+		"description": "Grant UCI access for the router report (email daily report) LuCI application",
+		"read": {
+			"uci": [ "routerreport" ]
+		},
+		"write": {
+			"uci": [ "routerreport" ]
+		}
+	}
+}

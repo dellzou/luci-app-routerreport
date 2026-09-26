@@ -1,0 +1,351 @@
+#!/bin/sh
+# router-daily-report —— 每日运行报告（默认每天 08:00 汇总昨日，邮件发送）
+# 依赖：/etc/msmtprc（SMTP 凭据）、/etc/router-report.conf（收件人配置）
+#       /mnt/data/sysreport/metrics-*.csv（由 router-metrics 采集）
+# 用法：router-daily-report [--force] [--dry-run] [--date YYYY-MM-DD]
+#       --force    忽略当日已发送标记，强制重发
+#       --dry-run  只生成邮件正文到 /tmp，不发送
+#       --date     指定报告日期（默认为昨天）
+# 生成：WorkBuddy  2026-09-26
+
+CONF=/etc/router-report.conf
+[ -r "$CONF" ] && . "$CONF"
+
+DIR=/mnt/data/sysreport
+LOGDIR=/mnt/data/logs
+ROUTER_NAME="${ROUTER_NAME:-软路由}"
+MSMTP_ACCOUNT="${MSMTP_ACCOUNT:-default}"
+# WARN_THRESHOLD：需关注异常达到多少条才判定"有需要注意的情况"（默认 1 = 原有的 >0 行为）
+WARN_THRESHOLD="${WARN_THRESHOLD:-1}"
+case "$WARN_THRESHOLD" in ''|*[!0-9]*) WARN_THRESHOLD=1 ;; esac
+MAX_RETRY="${MAX_RETRY:-3}"
+RETRY_WAIT="${RETRY_WAIT:-30}"
+
+FORCE=0; DRYRUN=0; TARGET_DATE=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--force)    FORCE=1 ;;
+		--dry-run)  DRYRUN=1 ;;
+		--date)     shift; TARGET_DATE="$1" ;;
+		--date=*)   TARGET_DATE="${1#--date=}" ;;
+	esac
+	shift
+done
+
+TODAY=$(date +%Y-%m-%d)
+SENT_FLAG="$DIR/.sent-$TODAY"
+
+# ---------- 0. 防重复 ----------
+if [ "$FORCE" -eq 0 ] && [ "$DRYRUN" -eq 0 ] && [ -f "$SENT_FLAG" ]; then
+	logger -t router-daily-report "今日日报已发送，跳过"
+	exit 0
+fi
+
+# ---------- 1. 时间基准 ----------
+if [ -n "$TARGET_DATE" ]; then
+	YDAY="$TARGET_DATE"
+	Y_EPOCH=$(date -d "$YDAY" +%s 2>/dev/null) || { echo "日期格式错误: $TARGET_DATE"; exit 1; }
+else
+	Y_EPOCH=$(( $(date +%s) - 86400 ))
+	YDAY=$(date -d @$Y_EPOCH +%Y-%m-%d)
+fi
+Y_MON=$(date -d @$Y_EPOCH +%b)
+Y_DAY=$(date -d @$Y_EPOCH +%e | tr -d ' ')
+Y_YEAR=$(date -d @$Y_EPOCH +%Y)
+NEXT_DAY=$(date -d @$(( Y_EPOCH + 86400 )) +%Y-%m-%d)
+
+TMP=/tmp/rd.$$
+trap 'rm -f "$TMP".samples "$TMP".log "$TMP".err "$TMP".real "$TMP".mail' EXIT
+
+# ---------- 2. 采样数据汇总 ----------
+grep -h ",$YDAY " "$DIR"/metrics-*.csv 2>/dev/null | sort -t, -k1,1n > "$TMP.samples"
+grep -h ",$NEXT_DAY " "$DIR"/metrics-*.csv 2>/dev/null | sort -t, -k1,1n | head -1 >> "$TMP.samples"
+CNT=$(grep -hc ",$YDAY " "$DIR"/metrics-*.csv 2>/dev/null | awk '{s+=$1}END{print s+0}' | tr -dc 0-9)
+SAMPLE_N=${CNT:-0}
+
+set -- $(awk -F, 'NR==1{prx=$3;ptx=$4;next}{drx=$3-prx;dtx=$4-ptx;if(drx>0)srx+=drx;if(dtx>0)stx+=dtx;prx=$3;ptx=$4}END{printf "%d %d", srx+0, stx+0}' "$TMP.samples" 2>/dev/null)
+TRAF_DOWN=${1:-0}; TRAF_UP=${2:-0}
+
+set -- $(awk -F, '{n++;c+=$5;m+=$6;l+=$7;if($7>lm)lm=$7;if($5>cm)cm=$5;if($6>mm)mm=$6}END{if(n>0)printf "%.1f %.1f %.2f %.2f %d %d",c/n,m/n,l/n,lm+0,cm+0,mm+0; else printf "0 0 0 0 0 0"}' "$TMP.samples" 2>/dev/null)
+CPU_AVG=${1:-0}; MEM_AVG=${2:-0}; LOAD_AVG=${3:-0}; LOAD_MAX=${4:-0}; CPU_MAX=${5:-0}; MEM_MAX=${6:-0}
+
+COVERAGE=$(( SAMPLE_N * 100 / 288 ))
+[ "$COVERAGE" -gt 100 ] && COVERAGE=100
+
+human() {
+	awk -v b="$1" 'BEGIN{
+		if (b < 0) b = 0;
+		n = split("B KB MB GB TB PB", u, " ");
+		i = 1;
+		while (b >= 1024 && i < n) { b /= 1024; i++ }
+		if (i == 1) printf "%.0f %s", b, u[i];
+		else printf "%.2f %s", b, u[i];
+	}'
+}
+HUM_DOWN=$(human "$TRAF_DOWN")
+HUM_UP=$(human "$TRAF_UP")
+HUM_TOTAL=$(human $(( TRAF_DOWN + TRAF_UP )))
+
+# ---------- 3. 日志异常分析 ----------
+{
+	cat "$LOGDIR/messages" 2>/dev/null
+	cat "$LOGDIR/messages.old" 2>/dev/null
+} | grep -E "^[A-Z][a-z]{2} $Y_MON +$Y_DAY [0-9:]+ $Y_YEAR " 2>/dev/null | grep -v 'FLOOD2' > "$TMP.log"
+# 说明：不合并 archive/*.log —— 那些是 messages 的定时快照副本，纳入会造成同一条日志重复计数
+TOTAL_LOG=$(wc -l < "$TMP.log" 2>/dev/null | tr -d ' '); [ -n "$TOTAL_LOG" ] || TOTAL_LOG=0
+
+# 异常判定：① syslog 优先级为 err/warning 及以上（锚定「时间 年份 facility.level」位置，避免误命中正文文字）
+#          ② 正文显式标注 [error] / panic / 段错误 / 被 OOM 杀
+ERRPAT='[0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4} [a-z]+\.(emerg|alert|crit|err|warning) |\[error\]|panic|segfault|oom-kill|out of memory'
+grep -E "$ERRPAT" "$TMP.log" 2>/dev/null > "$TMP.err"
+CNT=$(wc -l < "$TMP.err" 2>/dev/null | tr -dc 0-9); ERR_N=${CNT:-0}
+
+# ① 已知无害噪音：组件探测不存在的虚拟设备/内核模块、UPnP 热更新竞态、netdata 启动期自检、
+#    iStoreOS 组件用 err 级别打印的正常信息
+NOISE='DEVICE-MAPPER|PROCFILE: Cannot open|Cannot read directory .*/proc/spl|Cannot refresh interface .* carrier state|Cannot read NUMA node directory|Cannot read ECC memory errors directory|plugins\.d/(perf|ioping)\.plugin|Failed to remove PCP mapping|send_batch|INTERNAL ERROR: indexing of section|This agent doesn.t have ACLK|Cannot get my current process scheduling policy|Cannot adjust netdata scheduling policy|POLLFD: LISTENER|child pid [0-9]+ exited with code 1|can.t open .*/proc/sys/oaf/|linkease app gateway listening|crond\[[0-9]+\]: (USER root pid|crond \(busybox)|backend ready'
+# ② 配置类噪音：AdGuard 把反查域转给 dnsmasq(5353)，而它只应答本地网段、其余空等 20s 超时
+#    （AGH 为 parallel 模式，超时不阻断解析，属设计冗余）
+CONFNOISE='dnsproxy: .*(127\.0\.0\.1:5353|in-addr\.arpa|ip6\.arpa)'
+# ③ mihomo DNS 被拒 —— 不进噪音、保留在「需关注」：它反映代理链路是否中断过（重启/停止期间会出现）
+MIHOMO_PTR='dnsproxy: .*127\.0\.0\.1:7874'
+
+grep -vE "$NOISE" "$TMP.err" 2>/dev/null | grep -vE "$CONFNOISE" > "$TMP.real"
+
+# 计数统一走 tr -dc 0-9 + 默认值，避免空值/多行把 test 打崩（busybox test 对非数字报 out of range）
+CNT=$(wc -l < "$TMP.real" 2>/dev/null | tr -dc 0-9);        REAL_N=${CNT:-0}
+CNT=$(grep -cE "$CONFNOISE" "$TMP.err" 2>/dev/null | tr -dc 0-9); CONF_N=${CNT:-0}
+CNT=$(grep -cE "$NOISE" "$TMP.err" 2>/dev/null | tr -dc 0-9);     NOISE_N=${CNT:-0}
+CNT=$(wc -l < "$TMP.err" 2>/dev/null | tr -dc 0-9);              ERR_N=${CNT:-0}
+CNT=$(grep -c 'got 429' "$TMP.real" 2>/dev/null | tr -dc 0-9);   LIMIT_N=${CNT:-0}
+CNT=$(grep -cE "$MIHOMO_PTR" "$TMP.real" 2>/dev/null | tr -dc 0-9); MIHOMO_N=${CNT:-0}
+
+# 需关注异常：按进程归类 Top5
+TOP_SRC=""
+if [ "$REAL_N" -gt 0 ]; then
+	TOP_SRC=$(awk '{print $7}' "$TMP.real" | sed 's/\[[0-9]*\]//;s/:$//' | sort | uniq -c | sort -rn | head -5 |
+		awk '{printf "<li><code>%s</code> — %s 条</li>", $2, $1}')
+fi
+
+# 异常样例（去重后取前 3 条，截断 200 字符）
+SAMPLES=""
+if [ "$REAL_N" -gt 0 ]; then
+	SAMPLES=$(awk '{$1="";$2="";$3="";$4="";$5="";$6="";sub(/^ +/,"");print}' "$TMP.real" 2>/dev/null |
+		sed 's/\[[0-9]*\]: /: /' | cut -c1-170 |
+		sort | uniq -c | sort -rn | head -3 |
+		awk '{c=$1; $1=""; sub(/^ /,""); printf "<div class=\"smp\">[x%s] %s</div>", c, $0}')
+fi
+
+# ---------- 4. 开关机记录 ----------
+BOOT_NOTE=""
+if [ -f "$LOGDIR/boot.log" ]; then
+	BOOT_LINE=$(grep -E "^$YDAY" "$LOGDIR/boot.log" 2>/dev/null | head -2)
+	if [ -n "$BOOT_LINE" ]; then
+		echo "$BOOT_LINE" | grep -q "异常" && BOOT_NOTE="<span class=\"bad\">检测到异常关机记录</span>" \
+			|| BOOT_NOTE="有重启记录（关机过程正常）"
+	else
+		BOOT_NOTE="全天无重启"
+	fi
+else
+	BOOT_NOTE="无开机记录文件"
+fi
+
+# ---------- 5. 服务健康检查 ----------
+svc() {
+	if /etc/init.d/$1 status >/dev/null 2>&1; then echo "<span class=\"ok\">运行中</span>"
+	else echo "<span class=\"bad\">未运行</span>"; fi
+}
+SVC_ADG=$(svc adguardhome)
+SVC_ND=$(svc netdata)
+SVC_DNS=$(svc dnsmasq)
+SVC_NET=$(svc network)
+SVC_SQM=$(svc sqm)
+
+SVC_DOWN=0
+for s in "$SVC_ADG" "$SVC_ND" "$SVC_DNS" "$SVC_NET" "$SVC_SQM"; do
+	echo "$s" | grep -q "未运行" && SVC_DOWN=$(( SVC_DOWN + 1 ))
+done
+
+# ---------- 6. 结论与建议 ----------
+ISSUES=""
+[ "$REAL_N" -ge "$WARN_THRESHOLD" ] && ISSUES="$ISSUES<li>发现 <b>$REAL_N</b> 条需关注的错误日志</li>"
+[ "$SVC_DOWN" -gt 0 ] && ISSUES="$ISSUES<li>有 <b>$SVC_DOWN</b> 个关键服务未运行</li>"
+[ "$COVERAGE" -lt 90 ] && ISSUES="$ISSUES<li>数据覆盖率仅 <b>$COVERAGE%</b>，期间可能发生过重启或断电</li>"
+echo "$BOOT_NOTE" | grep -q "异常" && ISSUES="$ISSUES<li>开机记录显示上次为异常关机</li>"
+
+if [ -n "$ISSUES" ]; then
+	VERDICT_ICON="⚠️"; VERDICT_TEXT="有需要注意的情况"; VERDICT_COLOR="#d97706"
+	ISSUE_BLOCK="<div class=\"issues\"><div class=\"ih\">需关注事项</div><ul>$ISSUES</ul></div>"
+else
+	VERDICT_ICON="✅"; VERDICT_TEXT="一切正常"; VERDICT_COLOR="#059669"
+	ISSUE_BLOCK="<div class=\"issues ok-issues\">昨日未发现需要处理的问题。</div>"
+fi
+
+# ⚠️ 每条提示必须独占一行：QQ SMTP 严格执行 RFC5321（单行 ≤ 998 字节），
+#    4 条提示挤在一行约 1089 字节 → 服务器直接回 "500 Line too long" 拒收（2026-09-26 实测踩坑）
+TIP=""
+[ "$CONF_N" -gt 0 ] && TIP="$TIP
+<li><b>AdGuard 反查噪音 $CONF_N 条</b>：<code>in-addr.arpa</code> / <code>ip6.arpa</code> 被转给 dnsmasq(5353)，而它只应答本地网段、其余空等 20 秒超时（AGH 为 parallel 模式，不阻断解析，属设计冗余）。</li>"
+[ "$MIHOMO_N" -gt 0 ] && TIP="$TIP
+<li>需关注项中有 $MIHOMO_N 条是 mihomo DNS（<code>127.0.0.1:7874</code>）连接被拒，通常出现在 netflow/mihomo 重启或停止期间；AGH 为 parallel 模式会由 DoH 自动接管、DNS 不中断。若该数字持续增长，说明代理链路异常，需检查 mihomo 进程。</li>"
+[ "$NOISE_N" -gt 0 ] && TIP="$TIP
+<li>另有 $NOISE_N 条组件自检噪音（netdata 探测虚拟设备/虚拟网卡、perf/ioping 插件缺依赖、UPnP 映射热更新竞态、oaf 内核模块未加载等），已自动归类，无需处理。</li>"
+[ "$LIMIT_N" -gt 0 ] && TIP="$TIP
+<li>需关注项中有 $LIMIT_N 条是腾讯 DoH（<code>doh.pub</code>）返回 <b>429 限流</b>，AdGuard 会自动回退到其他上游，不影响正常解析；若持续增多，建议调整 AGH 上游权重或增补上游。</li>"
+
+# ---------- 7. 组装邮件 ----------
+if [ "$COVERAGE" -ge 95 ]; then DATA_NOTE="数据完整"; else DATA_NOTE="数据覆盖 $COVERAGE%（$SAMPLE_N / 288 个采样点）"; fi
+
+SUBJECT="[$ROUTER_NAME] $YDAY 日报 $VERDICT_ICON $VERDICT_TEXT"
+SUBJ_B64=$(printf '%s' "$SUBJECT" | openssl base64 -A)
+
+cat > "$TMP.mail" <<EOF
+From: $ROUTER_NAME <$FROM_ADDR>
+To: $RECIPIENT
+Subject: =?UTF-8?B?$SUBJ_B64?=
+MIME-Version: 1.0
+Content-Type: text/html; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+Date: $(date -R)
+
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#f4f5f7;">
+<table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#f4f5f7;padding:22px 12px;">
+<tr><td align="center">
+<table width="640" cellpadding="0" cellspacing="0" role="presentation" style="width:640px;max-width:100%;background:#ffffff;border-radius:10px;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;color:#1f2328;">
+  <tr><td style="background:${VERDICT_COLOR};padding:18px 26px;">
+    <div style="color:#fff;font-size:17px;font-weight:600;">$ROUTER_NAME · 每日运行报告</div>
+    <div style="color:rgba(255,255,255,.9);font-size:12.5px;margin-top:5px;">报告周期：$YDAY 00:00 – 24:00 &nbsp;|&nbsp; $DATA_NOTE</div>
+  </td></tr>
+
+  <tr><td style="padding:22px 26px 6px;">
+    <div style="font-size:15px;font-weight:600;color:${VERDICT_COLOR};margin-bottom:10px;">$VERDICT_ICON $VERDICT_TEXT</div>
+    $ISSUE_BLOCK
+  </td></tr>
+
+  <tr><td style="padding:6px 26px 0;">
+    <div class="h">流量（WAN 物理口口径）</div>
+    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" class="grid">
+      <tr>
+        <td class="card"><div class="cl">下行</div><div class="cv">$HUM_DOWN</div></td>
+        <td class="card"><div class="cl">上行</div><div class="cv">$HUM_UP</div></td>
+        <td class="card"><div class="cl">合计</div><div class="cv">$HUM_TOTAL</div></td>
+      </tr>
+    </table>
+  </td></tr>
+
+  <tr><td style="padding:14px 26px 0;">
+    <div class="h">资源占用（全 ${SAMPLE_N} 个采样点平均）</div>
+    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" class="grid">
+      <tr>
+        <td class="card"><div class="cl">CPU 平均</div><div class="cv">${CPU_AVG}%</div><div class="cs">峰值 ${CPU_MAX}%</div></td>
+        <td class="card"><div class="cl">内存平均</div><div class="cv">${MEM_AVG}%</div><div class="cs">峰值 ${MEM_MAX}%</div></td>
+        <td class="card"><div class="cl">负载平均</div><div class="cv">${LOAD_AVG}</div><div class="cs">峰值 ${LOAD_MAX}</div></td>
+      </tr>
+    </table>
+  </td></tr>
+
+  <tr><td style="padding:16px 26px 0;">
+    <div class="h">日志与异常</div>
+    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" class="kv">
+      <tr><td class="k">昨日日志总量</td><td class="v">$TOTAL_LOG 行</td></tr>
+      <tr><td class="k">需关注错误</td><td class="v">$([ "$REAL_N" -gt 0 ] && echo "<span class=\"bad\">$REAL_N 条</span>" || echo "<span class=\"ok\">0 条</span>")</td></tr>
+      <tr><td class="k">已知无害噪音</td><td class="v">$NOISE_N 条（组件自检，已归类）</td></tr>
+      <tr><td class="k">配置类噪音</td><td class="v">$CONF_N 条（反查域冗余上游，已归类）</td></tr>
+      <tr><td class="k">开关机情况</td><td class="v">$BOOT_NOTE</td></tr>
+    </table>
+    $( [ -n "$TOP_SRC" ] && echo "<div class=\"top\"><div class=\"tl\">错误来源 Top</div><ul>$TOP_SRC</ul></div>$SAMPLES" )
+  </td></tr>
+
+  <tr><td style="padding:16px 26px 0;">
+    <div class="h">关键服务状态</div>
+    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" class="kv">
+      <tr><td class="k">AdGuard Home（DNS 过滤）</td><td class="v">$SVC_ADG</td></tr>
+      <tr><td class="k">Netdata（监控面板）</td><td class="v">$SVC_ND</td></tr>
+      <tr><td class="k">dnsmasq（DHCP）</td><td class="v">$SVC_DNS</td></tr>
+      <tr><td class="k">network（网络）</td><td class="v">$SVC_NET</td></tr>
+      <tr><td class="k">SQM（上行整形）</td><td class="v">$SVC_SQM</td></tr>
+    </table>
+  </td></tr>
+
+  $( [ -n "$TIP" ] && echo "<tr><td style=\"padding:16px 26px 0;\"><div class=\"h\">运维提示</div><ul class=\"tips\">$TIP</ul></td></tr>" )
+
+  <tr><td style="padding:18px 26px 24px;">
+    <div style="border-top:1px solid #eaecef;padding-top:12px;font-size:11.5px;color:#8b949e;line-height:1.7;">
+      由软路由 router-daily-report 自动生成并发送 · 发送时间 $(date '+%Y-%m-%d %H:%M')<br>
+      数据来源：/proc/stat、/proc/meminfo、/proc/net/dev 每 5 分钟采样；日志来自 $LOGDIR
+    </div>
+  </td></tr>
+</table>
+</td></tr>
+</table>
+<style>
+  .h{font-size:13px;font-weight:600;color:#57606a;letter-spacing:.3px;padding-bottom:8px;border-bottom:1px solid #eaecef;}
+  .grid{border-collapse:separate;border-spacing:8px 0;margin-top:10px;}
+  .card{background:#f6f8fa;border-radius:8px;padding:12px 14px;width:33%;}
+  .cl{font-size:12px;color:#57606a;}
+  .cv{font-size:19px;font-weight:600;margin-top:4px;color:#1f2328;}
+  .cs{font-size:11.5px;color:#8b949e;margin-top:3px;}
+  .kv{width:100%;border-collapse:collapse;margin-top:8px;}
+  .kv td{font-size:13px;padding:7px 0;border-bottom:1px solid #f0f2f4;}
+  .kv .k{color:#57606a;}
+  .kv .v{text-align:right;font-weight:500;}
+  .ok{color:#059669;} .bad{color:#dc2626;}
+  .issues{background:#fff8ea;border-left:3px solid #d97706;border-radius:6px;padding:12px 16px;}
+  .issues.ok-issues{background:#f0fdf4;border-left-color:#059669;color:#166534;}
+  .ih{font-weight:600;font-size:13.5px;margin-bottom:6px;color:#92400e;}
+  .issues ul{margin:0;padding-left:18px;font-size:13px;line-height:1.9;}
+  .top{margin-top:12px;font-size:12.5px;}
+  .tl{color:#57606a;font-weight:600;margin-bottom:5px;}
+  .top ul{margin:0;padding-left:18px;line-height:1.9;color:#444c56;}
+  .smp{background:#f6f8fa;border-radius:5px;padding:6px 10px;font-family:ui-monospace,Consolas,monospace;font-size:11.5px;color:#57606a;margin-top:5px;word-break:break-all;}
+  .tips{margin:0;padding-left:18px;font-size:12.5px;line-height:1.9;color:#444c56;}
+  code{background:#eff1f3;padding:1px 4px;border-radius:3px;font-size:11.5px;}
+</style>
+</body></html>
+EOF
+
+# ---------- 7.5 超长行折行保险 ----------
+# RFC5321 规定单行 ≤ 998 字节，QQ SMTP 严格校验并直接拒收（500 Line too long）。
+# 邮件头不参与折行（base64 编码的 Subject 折行会损坏），只折空行之后的正文。
+if awk 'length($0)>900{f=1} END{exit (f?0:1)}' "$TMP.mail" 2>/dev/null; then
+	awk 'BEGIN{h=1} h{print; if($0=="")h=0; next}
+	     { s=$0
+	       while(length(s)>900){ i=900; while(i>1 && substr(s,i,1)!=" ")i--; if(i<=1)i=900
+	         print substr(s,1,i-1); s=substr(s,i+1) }
+	       print s }' "$TMP.mail" > "$TMP.mail.fold" && mv "$TMP.mail.fold" "$TMP.mail"
+	logger -t router-daily-report "邮件正文存在超长行（>900 字节），已自动折行"
+fi
+
+# ---------- 8. 发送 ----------
+if [ "$DRYRUN" -eq 1 ]; then
+	cp "$TMP.mail" /tmp/rd-preview.mail
+	echo "DRY-RUN: 邮件正文已生成 -> /tmp/rd-preview.mail"
+	echo "主题: $SUBJECT"
+	echo "收件人: $RECIPIENT  发件人: $FROM_ADDR"
+	echo "流量: 下行 $HUM_DOWN / 上行 $HUM_UP / 需关注异常 $REAL_N 条 / 覆盖率 $COVERAGE%"
+	exit 0
+fi
+
+[ -n "$RECIPIENT" ] || { logger -t router-daily-report "未配置 RECIPIENT，放弃发送"; exit 1; }
+
+OK=0; I=1
+while [ "$I" -le "$MAX_RETRY" ]; do
+	if msmtp -a "$MSMTP_ACCOUNT" "$RECIPIENT" < "$TMP.mail" 2>>"$LOGDIR/msmtp.log"; then
+		OK=1; break
+	fi
+	logger -t router-daily-report "第 $I 次发送失败，${RETRY_WAIT}s 后重试"
+	[ "$I" -lt "$MAX_RETRY" ] && sleep "$RETRY_WAIT"
+	I=$(( I + 1 ))
+done
+
+if [ "$OK" -eq 1 ]; then
+	touch "$SENT_FLAG"
+	logger -t router-daily-report "日报已发送至 $RECIPIENT（$YDAY，异常 $REAL_N 条）"
+else
+	mkdir -p "$DIR/failed"
+	cp "$TMP.mail" "$DIR/failed/report-$YDAY.mail"
+	logger -t router-daily-report "日报发送失败，已存至 $DIR/failed/report-$YDAY.mail"
+	exit 1
+fi
+exit 0

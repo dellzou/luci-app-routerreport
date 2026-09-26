@@ -1,0 +1,16 @@
+0.1.0 (2026-09-26)
+
+target : iStoreOS 25.12.5 (x86_64, apk) / LuCI 26.253 + luci-compat
+form   : 纯文件 LuCI 应用（免 SDK 免编译）+ 两个 POSIX shell 脚本
+
+verified on device:
+  - 静态检查（shell / JSON / Lua 控制器 / 模板内嵌 Lua）
+  - 控制器在真实 LuCI Lua 环境可加载
+  - 模板数据层 9 字段读取正确
+  - UCI 解析自检 + 首次安装迁移现有配置
+  - 渲染脚本幂等（连跑两次第二次报 unchanged）
+  - crontab 单行、无标记累积、时间格式正确
+  - 生成的 msmtprc 与手工配置逐行一致
+  - 告警阈值生效（调大后正文条目消失）
+  - 打桩直调 action_api：save(幂等/非法输入)、send(成功/非法日期)、status 全部返回合法 JSON
+  - 权限：/etc/config/routerreport 与 /etc/msmtprc 均为 600

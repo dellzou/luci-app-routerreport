@@ -1,0 +1,146 @@
+#!/bin/sh
+# router-report-apply —— 把 UCI(/etc/config/routerreport) 渲染成运行配置
+#
+# 职责（只做渲染，不改业务脚本）：
+#   1) 生成 /etc/router-report.conf  （router-daily-report 读取的收件人/阈值等）
+#   2) 生成或更新 /etc/msmtprc（0600）
+#   3) 按「启用开关 + 发送时间」维护 crontab 里 router-daily-report 那一行
+#   4) 输出一行 JSON 供 WebUI 回显
+#
+# 生成：WorkBuddy  2026-09-26
+# 用法：router-report-apply            # 渲染并输出 JSON
+#       router-report-apply --quiet    # 不输出
+
+set -u
+
+CONF=/etc/router-report.conf
+MSMTP=/etc/msmtprc
+CRON=/etc/crontabs/root
+BAK=/mnt/data/backup-routerreport
+QUIET=0
+[ "${1:-}" = "--quiet" ] && QUIET=1
+
+uget() {
+	uci -q get "routerreport.$1" 2>/dev/null
+}
+
+sanitize() {
+	# 去掉会破坏 shell 双引号字符串的字符（用于写入 /etc/router-report.conf 与 /etc/msmtprc）
+	printf '%s' "$1" | tr -d '"\\`$'
+}
+
+sedsafe() {
+	# 额外去掉 sed 替换串里的分隔符与反向引用（用于 host/port/user/from 的原地替换）
+	printf '%s' "$1" | tr -d '|&\\'
+}
+
+digits_only() {
+	printf '%s' "$1" | tr -dc '0-9'
+}
+
+# ---------- 1. 读配置 ----------
+ENABLED=$(digits_only "$(uget main.enabled)"); [ -n "$ENABLED" ] || ENABLED=0
+SEND_TIME=$(sanitize "$(uget main.send_time)"); [ -n "$SEND_TIME" ] || SEND_TIME="08:00"
+ROUTER_NAME=$(sanitize "$(uget main.router_name)"); [ -n "$ROUTER_NAME" ] || ROUTER_NAME="软路由"
+RECIPIENT=$(sanitize "$(uget main.recipient)")
+FROM=$(sanitize "$(uget main.from)")
+THRESH=$(digits_only "$(uget main.warn_threshold)"); [ -n "$THRESH" ] || THRESH=1
+SMTP_HOST=$(sanitize "$(uget smtp.host)"); [ -n "$SMTP_HOST" ] || SMTP_HOST="smtp.qq.com"
+SMTP_PORT=$(digits_only "$(uget smtp.port)"); [ -n "$SMTP_PORT" ] || SMTP_PORT=465
+SMTP_USER=$(sanitize "$(uget smtp.user)")
+SMTP_PASS=$(sanitize "$(uget smtp.password)")
+
+# 发送时间合法性校验（HH:MM，00-23:00-59），非法则回退 08:00
+HH=$(printf '%s' "$SEND_TIME" | cut -d: -f1)
+MM=$(printf '%s' "$SEND_TIME" | cut -d: -f2)
+HH=$(digits_only "$HH"); MM=$(digits_only "$MM")
+if [ -z "$HH" ] || [ -z "$MM" ] || [ "$HH" -gt 23 ] || [ "$MM" -gt 59 ]; then
+	HH=08; MM=00; SEND_TIME="08:00"
+fi
+[ "${#HH}" -eq 1 ] && HH="0$HH"
+[ "${#MM}" -eq 1 ] && MM="0$MM"
+SEND_TIME="$HH:$MM"
+
+[ -n "$FROM" ] || FROM="$SMTP_USER"
+
+# ---------- 2. 写 /etc/router-report.conf ----------
+{
+	echo "# 由 LuCI 应用「邮件日报」自动生成 —— 请勿手工编辑，界面保存会覆盖本文件"
+	echo "# 生成时间：$(date '+%Y-%m-%d %H:%M:%S')"
+	echo "ROUTER_NAME=\"$ROUTER_NAME\""
+	echo "RECIPIENT=\"$RECIPIENT\""
+	echo "FROM_ADDR=\"$FROM\""
+	echo "MSMTP_ACCOUNT=\"default\""
+	echo "MAX_RETRY=\"3\""
+	echo "RETRY_WAIT=\"30\""
+	echo "WARN_THRESHOLD=\"$THRESH\""
+} > "$CONF" 2>/dev/null
+
+# ---------- 3. 写 /etc/msmtprc ----------
+MSMTP_STATE="kept"
+if [ -n "$SMTP_PASS" ]; then
+	{
+		echo "# msmtprc —— 由 LuCI 应用「邮件日报」生成（WorkBuddy）"
+		echo "account default"
+		echo "host $SMTP_HOST"
+		echo "port $SMTP_PORT"
+		echo "tls on"
+		echo "tls_starttls off"
+		echo "auth on"
+		echo "user $SMTP_USER"
+		echo "password $SMTP_PASS"
+		echo "from $FROM"
+		echo "set_from_header on"
+		echo "allow_from_override off"
+		echo "syslog LOG_MAIL"
+	} > "$MSMTP" 2>/dev/null
+	chmod 600 "$MSMTP"
+	MSMTP_STATE="written"
+elif [ -f "$MSMTP" ]; then
+	# 密码留空 = 不改密码，但主机/端口/账号/发件人若变了要同步
+	S_HOST=$(sedsafe "$SMTP_HOST"); S_PORT=$(sedsafe "$SMTP_PORT")
+	S_USER=$(sedsafe "$SMTP_USER"); S_FROM=$(sedsafe "$FROM")
+	sed -i \
+		-e "s|^host .*|host $S_HOST|" \
+		-e "s|^port .*|port $S_PORT|" \
+		-e "s|^user .*|user $S_USER|" \
+		-e "s|^from .*|from $S_FROM|" \
+		"$MSMTP" 2>/dev/null
+	chmod 600 "$MSMTP"
+	MSMTP_STATE="updated"
+fi
+
+# ---------- 4. 维护 crontab ----------
+CRON_STATE="unchanged"
+MARK="#ROUTERREPORT-CRON"   # 固定标记：下次渲染时按它把自己写的行/注释一起清掉，避免反复保存堆积
+TMP="/tmp/.rr-cron.$$"
+if [ -f "$CRON" ]; then
+	cp "$CRON" "$TMP"
+else
+	: > "$TMP"
+fi
+grep -vE "$MARK|/usr/bin/router-daily-report" "$TMP" > "$TMP.new" 2>/dev/null
+if [ "$ENABLED" = "1" ] && [ -n "$RECIPIENT" ]; then
+	printf '%s 每日运行报告（由「邮件日报」应用维护，请勿手改）\n' "$MARK" >> "$TMP.new"
+	# 去掉前导零，写成习惯的 "0 8 * * *" 而不是 "00 08 * * *"
+	printf '%s %s * * * /usr/bin/router-daily-report\n' "${MM#0}" "${HH#0}" >> "$TMP.new"
+	CRON_STATE="enabled"
+else
+	CRON_STATE="disabled"
+fi
+if ! cmp -s "$TMP.new" "$TMP" 2>/dev/null; then
+	mkdir -p "$BAK" 2>/dev/null
+	cp "$TMP" "$BAK/crontab.before-$(date +%Y%m%d-%H%M%S)" 2>/dev/null
+	cp "$TMP.new" "$CRON"
+	/etc/init.d/cron restart >/dev/null 2>&1
+else
+	CRON_STATE="unchanged"
+fi
+rm -f "$TMP" "$TMP.new"
+
+# ---------- 5. 输出 ----------
+if [ "$QUIET" -eq 0 ]; then
+	printf '{"status":"ok","enabled":"%s","send_time":"%s","cron":"%s","msmtp":"%s","recipient":"%s","threshold":"%s"}\n' \
+		"$ENABLED" "$SEND_TIME" "$CRON_STATE" "$MSMTP_STATE" "$RECIPIENT" "$THRESH"
+fi
+exit 0

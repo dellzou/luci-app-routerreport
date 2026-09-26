@@ -1,0 +1,394 @@
+<%+header%>
+<%
+local uci = require "luci.model.uci".cursor()
+
+local function g(sec, opt, def)
+	local v = uci:get("routerreport", sec, opt)
+	if v == nil or v == "" then return def or "" end
+	return v
+end
+
+local function e(s)
+	s = tostring(s or "")
+	return (s:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;"))
+end
+
+-- 生成 API / 预览地址：优先用 LuCI 的 build_url；万一取不到（不同固件/环境差异）则退回固定路径，
+-- 保证页面不会因为一个依赖异常就白屏。
+local api_url     = "/cgi-bin/luci/admin/services/routerreport/api"
+local preview_url = "/cgi-bin/luci/admin/services/routerreport/preview"
+local ok_disp, disp = pcall(require, "luci.dispatcher")
+if ok_disp and disp and disp.build_url then
+	local ok1, u1 = pcall(disp.build_url, "admin", "services", "routerreport", "api")
+	local ok2, u2 = pcall(disp.build_url, "admin", "services", "routerreport", "preview")
+	if ok1 and u1 then api_url = u1 end
+	if ok2 and u2 then preview_url = u2 end
+end
+
+local cfg_enabled   = (g("main", "enabled", "0") == "1")
+local cfg_time      = g("main", "send_time", "08:00")
+local cfg_name      = g("main", "router_name", "软路由")
+local cfg_rcpt      = g("main", "recipient", "")
+local cfg_from      = g("main", "from", "")
+local cfg_thresh    = g("main", "warn_threshold", "1")
+local cfg_host      = g("smtp", "host", "smtp.qq.com")
+local cfg_port      = g("smtp", "port", "465")
+local cfg_user      = g("smtp", "user", "")
+local cfg_pass_set  = (g("smtp", "password", "") ~= "")
+%>
+
+<style>
+/* 跟随主题自身的缩进规范：.cbi-value 是 1rem，section 标题是 1.25rem；
+   而 .cbi-section-node 横向 padding 为 0 —— 自定义块必须自己补，否则会顶到左边 */
+.rr-pad { padding: 0 1rem .5rem 1rem; }
+.rr-table { width: 100%; max-width: 620px; border-collapse: collapse; font-size: 13px; }
+.rr-table td { padding: .45rem 0; border-bottom: 1px solid #eceef1; vertical-align: top; }
+.rr-table tr:last-child td { border-bottom: 0; }
+.rr-table .rr-k { width: 7.5rem; color: #57606a; }
+</style>
+
+<div class="cbi-map">
+	<h2 name="content">邮件日报</h2>
+	<div class="cbi-map-descr">
+		管理每日运行报告的收件人、发送时间与 SMTP 凭据；可立即测试发送、预览或补发任意一天。
+		配置存于 <code>/etc/config/routerreport</code>，保存后自动渲染到 <code>/etc/router-report.conf</code> 与 <code>/etc/msmtprc</code>（0600）。
+	</div>
+
+	<div class="cbi-section">
+		<h3>当前状态</h3>
+		<div class="cbi-section-node">
+			<div class="rr-pad">
+				<table class="rr-table">
+					<tr><td class="rr-k">自动发送</td><td id="st-enabled">读取中…</td></tr>
+					<tr><td class="rr-k">发送时间</td><td id="st-time">—</td></tr>
+					<tr><td class="rr-k">收件人</td><td id="st-rcpt">—</td></tr>
+					<tr><td class="rr-k">告警阈值</td><td id="st-thresh">—</td></tr>
+					<tr><td class="rr-k">SMTP 密码</td><td id="st-pass">—</td></tr>
+					<tr><td class="rr-k">最近发送</td><td id="st-sent">—</td></tr>
+				</table>
+			</div>
+		</div>
+	</div>
+
+	<form id="rr-config" onsubmit="return false">
+		<div class="cbi-section">
+			<h3>报告与收件人</h3>
+			<div class="cbi-section-node">
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="rr-enabled">启用每日自动发送</label>
+					<div class="cbi-value-field">
+						<input type="checkbox" id="rr-enabled"<% if cfg_enabled then %> checked="checked"<% end %> />
+						<div class="cbi-value-description">关闭后仅保留手动发送，定时任务里对应的行会被移除。</div>
+					</div>
+				</div>
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="rr-time">发送时间</label>
+					<div class="cbi-value-field">
+						<input type="text" class="cbi-input-text" id="rr-time" style="width:80px" value="<%=e(cfg_time)%>" placeholder="08:00" />
+						<div class="cbi-value-description">24 小时制 HH:MM，每天定时汇总<strong>前一天</strong>的数据。</div>
+					</div>
+				</div>
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="rr-name">路由器名称</label>
+					<div class="cbi-value-field">
+						<input type="text" class="cbi-input-text" id="rr-name" style="width:260px" value="<%=e(cfg_name)%>" />
+						<div class="cbi-value-description">出现在邮件标题与正文落款。</div>
+					</div>
+				</div>
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="rr-rcpt">收件人</label>
+					<div class="cbi-value-field">
+						<input type="text" class="cbi-input-text" id="rr-rcpt" style="width:260px" value="<%=e(cfg_rcpt)%>" placeholder="you@qq.com" />
+					</div>
+				</div>
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="rr-from">发件人</label>
+					<div class="cbi-value-field">
+						<input type="text" class="cbi-input-text" id="rr-from" style="width:260px" value="<%=e(cfg_from)%>" placeholder="与 SMTP 账号一致" />
+						<div class="cbi-value-description">留空则使用 SMTP 账号。</div>
+					</div>
+				</div>
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="rr-thresh">告警阈值</label>
+					<div class="cbi-value-field">
+						<input type="text" class="cbi-input-text" id="rr-thresh" style="width:80px" value="<%=e(cfg_thresh)%>" />
+						<div class="cbi-value-description">「需关注」异常达到该条数才判定为“有需要注意的情况”（默认 1）。</div>
+					</div>
+				</div>
+			</div>
+		</div>
+
+		<div class="cbi-section">
+			<h3>SMTP 发信</h3>
+			<div class="cbi-section-node">
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="rr-host">SMTP 主机</label>
+					<div class="cbi-value-field">
+						<input type="text" class="cbi-input-text" id="rr-host" style="width:260px" value="<%=e(cfg_host)%>" />
+					</div>
+				</div>
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="rr-port">端口</label>
+					<div class="cbi-value-field">
+						<input type="text" class="cbi-input-text" id="rr-port" style="width:80px" value="<%=e(cfg_port)%>" />
+						<div class="cbi-value-description">SSL 通常为 465（本应用按 465/SSL 写入配置）。</div>
+					</div>
+				</div>
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="rr-user">账号</label>
+					<div class="cbi-value-field">
+						<input type="text" class="cbi-input-text" id="rr-user" style="width:260px" value="<%=e(cfg_user)%>" />
+					</div>
+				</div>
+				<div class="cbi-value">
+					<label class="cbi-value-title" for="rr-pass">密码 / 授权码</label>
+					<div class="cbi-value-field">
+						<input type="password" class="cbi-input-text" id="rr-pass" style="width:260px" autocomplete="new-password"
+							placeholder="<% if cfg_pass_set then %>已设置，留空则不修改<% else %>尚未设置<% end %>" />
+						<div class="cbi-value-description">写入 <code>/etc/msmtprc</code>（权限 0600）。<strong>留空表示保持原值不变。</strong></div>
+					</div>
+				</div>
+			</div>
+		</div>
+	</form>
+
+	<div class="cbi-section">
+		<h3>操作</h3>
+		<div class="cbi-section-node">
+			<div class="rr-pad">
+				<div id="rr-msg" style="display:none;padding:.6rem .75rem;border-radius:.375rem;margin-bottom:.75rem;font-size:13px;line-height:1.7;white-space:pre-wrap"></div>
+
+				<div style="margin-bottom:.75rem">
+					<button type="button" id="btn-save" class="cbi-button cbi-button-apply" style="margin-right:.5rem" onclick="rrSave()">保存并应用</button>
+					<button type="button" id="btn-test" class="cbi-button cbi-button-action" onclick="rrSendToday()">立即测试发送（今天）</button>
+				</div>
+
+				<details id="rr-details">
+					<summary style="cursor:pointer;font-size:12.5px;color:#57606a">执行输出明细（点开查看命令回显与日志）</summary>
+					<pre id="rr-out" style="max-height:240px;overflow:auto;background:#f6f8fa;border-radius:.375rem;padding:.625rem;font-size:12px;line-height:1.6;color:#444;margin:.5rem 0 0">（等待操作）</pre>
+				</details>
+			</div>
+		</div>
+	</div>
+
+	<div class="cbi-section">
+		<h3>日报预览与补发</h3>
+		<div class="cbi-section-node">
+			<div class="cbi-value">
+				<label class="cbi-value-title" for="rr-date">选择日期</label>
+				<div class="cbi-value-field">
+					<input type="date" class="cbi-input-text" id="rr-date" style="width:170px;margin-right:8px" />
+					<button type="button" id="btn-preview" class="cbi-button" style="margin-right:8px" onclick="rrPreview()">生成预览</button>
+					<button type="button" id="btn-resend" class="cbi-button cbi-button-action" style="margin-right:8px" onclick="rrResend()">补发这一天</button>
+					<a class="cbi-button" id="rr-open" href="<%=e(preview_url)%>" target="_blank" style="text-decoration:none">新窗口打开预览</a>
+					<div class="cbi-value-description">预览不会发信；补发会按所选日期重新发送（已发送过也会强制重发）。</div>
+				</div>
+			</div>
+			<div style="margin:0 1rem .5rem 1rem;border:1px solid #ddd;border-radius:.375rem;overflow:hidden;background:#fff">
+				<iframe id="rr-preview" src="about:blank" style="width:100%;height:620px;border:0;display:block"></iframe>
+			</div>
+		</div>
+	</div>
+</div>
+
+<script type="text/javascript">
+var RR_API = '<%=e(api_url)%>';
+var RR_PREVIEW = '<%=e(preview_url)%>';
+
+function rrOut(msg) {
+	var out = document.getElementById('rr-out');
+	out.textContent = msg;
+}
+
+function rrDetails(openIt) {
+	var d = document.getElementById('rr-details');
+	if (openIt) { d.open = true; }
+}
+
+function rrMsg(kind, text) {
+	var box = document.getElementById('rr-msg');
+	var map = {
+		ok:   ['#e1f5ee', '#0f6e56', '#04342c'],
+		err:  ['#fcebeb', '#a32d2d', '#501313'],
+		busy: ['#e6f1fb', '#185fa5', '#042c53']
+	};
+	var c = map[kind] || map.busy;
+	box.style.display = 'block';
+	box.style.background = c[0];
+	box.style.border = '1px solid ' + c[1];
+	box.style.color = c[2];
+	box.textContent = text;
+	if (box.scrollIntoView) { box.scrollIntoView({ block: 'nearest' }); }
+}
+
+function rrBusy(id, on, label) {
+	var btn = document.getElementById(id);
+	if (!btn) { return; }
+	if (on) {
+		if (!btn.getAttribute('data-orig')) { btn.setAttribute('data-orig', btn.textContent); }
+		btn.textContent = label || '处理中…';
+		btn.disabled = true;
+	} else {
+		var o = btn.getAttribute('data-orig');
+		if (o) { btn.textContent = o; }
+		btn.disabled = false;
+	}
+}
+
+function rrPost(params, cb) {
+	var xhr = new XMLHttpRequest();
+	xhr.open('POST', RR_API, true);
+	xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+	xhr.timeout = 120000;
+	xhr.onreadystatechange = function () {
+		if (xhr.readyState !== 4) { return; }
+		var data = null;
+		try { data = JSON.parse(xhr.responseText); } catch (err) { data = null; }
+		cb(xhr.status, data, xhr.responseText);
+	};
+	xhr.ontimeout = function () { cb(0, null, '请求超时（120 秒）'); };
+	xhr.send(params);
+}
+
+function rrEnc(o) {
+	var out = [];
+	for (var k in o) { out.push(encodeURIComponent(k) + '=' + encodeURIComponent(o[k])); }
+	return out.join('&');
+}
+
+function rrVal(id) { var el = document.getElementById(id); return el ? el.value : ''; }
+
+function rrToday() {
+	var d = new Date();
+	return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2);
+}
+
+function rrSave() {
+	rrMsg('busy', '正在保存并应用…');
+	rrBusy('btn-save', true, '保存中…');
+	rrPost(rrEnc({
+		action: 'save',
+		enabled: document.getElementById('rr-enabled').checked ? '1' : '0',
+		send_time: rrVal('rr-time'),
+		router_name: rrVal('rr-name'),
+		recipient: rrVal('rr-rcpt'),
+		from: rrVal('rr-from'),
+		warn_threshold: rrVal('rr-thresh'),
+		smtp_host: rrVal('rr-host'),
+		smtp_port: rrVal('rr-port'),
+		smtp_user: rrVal('rr-user'),
+		smtp_password: rrVal('rr-pass')
+	}), function (code, data, raw) {
+		rrBusy('btn-save', false);
+		if (!data) {
+			rrMsg('err', '保存请求失败（HTTP ' + code + '）\n' + raw);
+			rrOut(raw); rrDetails(true);
+			return;
+		}
+		rrOut(data.message + '\n\n--- 渲染结果 ---\n' + (data.apply || ''));
+		if (data.status === 'ok') {
+			rrMsg('ok', '✅ ' + data.message + '（' + (data.at || '') + '）');
+			document.getElementById('rr-pass').value = '';
+			rrStatus();
+		} else {
+			rrMsg('err', '❌ ' + data.message);
+			rrDetails(true);
+		}
+	});
+}
+
+function rrSendToday() { rrSend(rrToday(), true); }
+
+function rrResend() {
+	var d = rrVal('rr-date');
+	if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) { rrMsg('err', '请先选择要补发的日期'); return; }
+	rrSend(d, true);
+}
+
+function rrSend(date, force) {
+	var isToday = (date === rrToday());
+	rrMsg('busy', '正在' + (isToday ? '发送今日报告' : '补发 ' + date + ' 的报告') + '，请稍候（最长约 90 秒，期间请勿刷新）…');
+	rrDetails(false);
+	rrBusy('btn-test', true, '发送中…');
+	rrBusy('btn-resend', true, '发送中…');
+	rrPost(rrEnc({ action: 'send', date: date, force: force ? '1' : '0' }),
+		function (code, data, raw) {
+			rrBusy('btn-test', false);
+			rrBusy('btn-resend', false);
+			if (!data) {
+				rrMsg('err', '发送请求失败（HTTP ' + code + '）\n' + raw);
+				rrOut(raw); rrDetails(true);
+				return;
+			}
+			var detail = '';
+			if (data.output) { detail += '--- 命令回显 ---\n' + data.output + '\n'; }
+			if (data.mailtail) { detail += '\n--- msmtp 日志（末尾）---\n' + data.mailtail + '\n'; }
+			if (data.failed_copy) { detail += '\n失败邮件副本：' + data.failed_copy + '\n'; }
+			rrOut(detail || '（命令无回显，发送成功时静默）');
+			if (data.status === 'ok') {
+				rrMsg('ok', data.message);
+			} else {
+				rrMsg('err', data.message + '\n（已展开下方「执行输出明细」）');
+				rrDetails(true);
+			}
+			rrStatus();
+		});
+}
+
+function rrPreview() {
+	var d = rrVal('rr-date');
+	if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) { rrMsg('err', '请先选择要预览的日期'); return; }
+	var url = RR_PREVIEW + '?date=' + d;
+	document.getElementById('rr-open').href = url;
+	var f = document.getElementById('rr-preview');
+	var done = false;
+	rrMsg('busy', '正在生成 ' + d + ' 的预览（只生成不发信）…');
+	rrBusy('btn-preview', true, '生成中…');
+	// iframe 加载完成 = 服务端已把正文渲染好；失败时正文里带「生成预览失败」，据此区分成功/失败
+	f.onload = function () {
+		if (done) { return; }
+		done = true;
+		rrBusy('btn-preview', false);
+		var txt = '';
+		try {
+			txt = (f.contentDocument && f.contentDocument.body) ? f.contentDocument.body.textContent : '';
+		} catch (err) { txt = ''; }
+		if (txt.indexOf('生成预览失败') >= 0) {
+			rrMsg('err', '预览生成失败：' + txt.replace(/\s+/g, ' ').slice(0, 180));
+		} else {
+			rrMsg('ok', '✅ 预览已生成（' + d + '）—— 下方窗口显示的就是该日期的邮件正文');
+		}
+	};
+	f.src = url;
+	// 兜底：万一 onload 不触发
+	setTimeout(function () {
+		if (!done) { done = true; rrBusy('btn-preview', false); rrMsg('busy', '预览请求已发出，若下方空白请稍等或刷新页面重试'); }
+	}, 20000);
+}
+
+function rrStatus() {
+	rrPost(rrEnc({ action: 'status' }), function (code, data, raw) {
+		if (!data) {
+			document.getElementById('st-enabled').textContent = '状态读取失败（HTTP ' + code + '）';
+			return;
+		}
+		document.getElementById('st-enabled').innerHTML = (data.enabled === '1')
+			? '<span style="color:#0f6e56">已启用</span>' : '<span style="color:#a32d2d">已停用</span>';
+		document.getElementById('st-time').textContent = data.send_time || '—';
+		document.getElementById('st-rcpt').innerHTML = data.recipient
+			? data.recipient : '<span style="color:#a32d2d">未设置</span>';
+		document.getElementById('st-thresh').textContent = (data.threshold || '1') + ' 条';
+		document.getElementById('st-pass').innerHTML = data.password_set
+			? '已设置' : '<span style="color:#a32d2d">未设置</span>';
+		document.getElementById('st-sent').textContent =
+			(data.recent_sent && data.recent_sent.length) ? data.recent_sent.join('、') : '暂无记录';
+	});
+}
+
+window.addEventListener('load', function () {
+	document.getElementById('rr-date').value = rrToday();
+	rrStatus();
+});
+</script>
+
+<%+footer%>

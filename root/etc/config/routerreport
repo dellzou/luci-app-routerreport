@@ -1,0 +1,13 @@
+config report 'main'
+	option enabled '1'
+	option send_time '08:00'
+	option router_name 'iStoreOS 软路由'
+	option recipient ''
+	option from ''
+	option warn_threshold '1'
+
+config smtp 'smtp'
+	option host 'smtp.qq.com'
+	option port '465'
+	option user ''
+	option password ''

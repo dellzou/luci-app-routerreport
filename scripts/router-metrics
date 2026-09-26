@@ -1,0 +1,54 @@
+#!/bin/sh
+# router-metrics —— 系统指标采集器（每 5 分钟一次）
+# 作用：为每日报告提供 CPU / 内存 / 负载 / WAN 流量的时间序列数据
+# 数据：/mnt/data/sysreport/metrics-YYYY-MM.csv
+# 列  ：epoch,time,wan_rx,wan_tx,cpu_pct,mem_pct,load1
+# 口径：wan = 物理 WAN 口 eth0 累计字节（PPPoE 重拨不清零，仅路由器重启清零）
+# 生成：WorkBuddy  2026-09-26
+
+DIR=/mnt/data/sysreport
+IFACE=eth0
+KEEP_DAYS=400
+MLOG=/mnt/data/logs/msmtp.log
+
+[ -d "$DIR" ] || mkdir -p "$DIR"
+FILE="$DIR/metrics-$(date +%Y-%m).csv"
+[ -s "$FILE" ] || echo "epoch,time,wan_rx,wan_tx,cpu_pct,mem_pct,load1" > "$FILE"
+
+# ---------- 1. WAN 累计字节 ----------
+eval "$(awk -v i="$IFACE:" '$1==i {print "RX="$2"; TX="$10}' /proc/net/dev)"
+[ -n "$RX" ] || RX=0
+[ -n "$TX" ] || TX=0
+
+# ---------- 2. CPU 占用（两次读数间隔 1 秒，取瞬时值） ----------
+cpu_read() {
+	set -- $(grep '^cpu ' /proc/stat)
+	CPU_T=$(( $2 + $3 + $4 + $5 + $6 + $7 + $8 + $9 ))
+	CPU_I=$(( $5 + $6 ))
+}
+cpu_read; T1=$CPU_T; I1=$CPU_I
+sleep 1
+cpu_read; T2=$CPU_T; I2=$CPU_I
+DT=$(( T2 - T1 )); DI=$(( I2 - I1 ))
+CPU=0
+[ "$DT" -gt 0 ] && CPU=$(( 100 * (DT - DI) / DT ))
+
+# ---------- 3. 内存占用（用 MemAvailable，比 MemFree 更贴近真实） ----------
+MT=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+MA=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+MEM=0
+[ "${MT:-0}" -gt 0 ] && MEM=$(( 100 * (MT - MA) / MT ))
+
+# ---------- 4. 负载 ----------
+LOAD=$(cut -d' ' -f1 /proc/loadavg)
+
+echo "$(date +%s),$(date '+%Y-%m-%d %H:%M'),$RX,$TX,$CPU,$MEM,$LOAD" >> "$FILE"
+
+# ---------- 5. 维护：清理过期数据、收敛 msmtp 日志 ----------
+find "$DIR" -name 'metrics-*.csv' -mtime +$KEEP_DAYS -exec rm -f {} \; 2>/dev/null
+if [ -f "$MLOG" ]; then
+	NL=$(wc -l < "$MLOG" | tr -d ' ')
+	[ "${NL:-0}" -gt 400 ] && { tail -n 120 "$MLOG" > "$MLOG.tmp" && mv "$MLOG.tmp" "$MLOG"; }
+fi
+
+exit 0
