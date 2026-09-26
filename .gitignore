@@ -18,6 +18,9 @@ Thumbs.db
 /tmp/
 *.tgz
 
+# 仓库不放二进制截图（README 用博客图床外链），但本地保留供离线 zip 打包
+docs/*.png
+
 # 敏感物：绝不入库
 .env
 *.secret

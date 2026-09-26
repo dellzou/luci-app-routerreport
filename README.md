@@ -7,7 +7,7 @@
 - 依赖：`luci-base`、`luci-compat`（一般已随固件安装）、以及已有的 `/usr/bin/router-daily-report`
 - 版本：0.1.0（2026-09-26）
 
-![邮件日报应用界面](docs/screenshot-panel.png)
+![邮件日报应用界面](https://xiaozou123.cn/wp-content/uploads/2026/09/istoreos-luci-email-daily-report-panel-scaled.png)
 
 > 实际渲染效果（本地用真实主题 CSS 复刻渲染，非示意图）。
 
@@ -51,14 +51,14 @@ luci-app-routerreport/
 ├── scripts/                               ← 配套的业务脚本（不使用界面也需要它们）
 │   ├── router-metrics                     指标采集（cron 每 5 分钟）
 │   └── router-daily-report                日报生成与发送（cron 每天一次）
-├── docs/screenshot-panel.png              README 用的界面截图
 ├── deploy.sh                             电脑侧一键部署（--check 只检查 / --install 真装）
 ├── install.sh                            路由器侧安装（备份 → 拷贝 → 迁移配置 → 清菜单缓存）
-├── README.md · LICENSE · VERSION
+├── README.md · LICENSE · VERSION · .gitattributes
 └── .gitignore
 ```
 
 > `scripts/` 里是随仓库发布的副本；部署后实际运行位置是 `/usr/bin/`。
+> 截图直接用博客图床外链，仓库里不放二进制文件。
 
 ---
 
