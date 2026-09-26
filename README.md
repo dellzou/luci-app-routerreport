@@ -104,7 +104,7 @@ sh deploy.sh --install    # 上传并安装（自动备份旧文件）
 3. **首次安装自动迁移**：把当前 `/etc/router-report.conf` + `/etc/msmtprc` + crontab 里的时间回填进 UCI，打开页面就能看到现有值，不用重填
 4. 清理 `/tmp/luci-indexcache*` 并 reload `rpcd`/`uhttpd`（否则菜单不出现）
 
-入口：**LuCI → 服务 → 邮件日报**（`http://192.168.100.1/cgi-bin/luci/admin/services/routerreport`）
+入口：**LuCI → 服务 → 邮件日报**（`http://<路由器IP>/cgi-bin/luci/admin/services/routerreport`）
 
 ---
 
@@ -138,7 +138,7 @@ rm -f  /tmp/luci-indexcache*
 
 ## 7. 安全说明
 
-- 页面走 LuCI 原有的 **HTTP + 会话认证**（仅内网 `192.168.100.1`，WAN 侧 REJECT）。密码在此链路上是明文的——和 LuCI 登录本身一致，未引入新的暴露面。
+- 页面走 LuCI 原有的 **HTTP + 会话认证**（仅内网 `<路由器IP>`，WAN 侧 REJECT）。密码在此链路上是明文的——和 LuCI 登录本身一致，未引入新的暴露面。
 - SMTP 授权码存在 `/etc/config/routerreport`（安装与每次保存都强制 `chmod 600`），渲染出的 `/etc/msmtprc` 同为 `600`。
 - 能登录 LuCI 就等于 root，因此"界面能读到授权码"不构成额外的权限提升。
 - ⚠️ **实测坑**：`/etc/config` 下权限是 600/644 混杂的，`uci commit` 不保证 0600 —— 所以本应用**显式 chmod**，不要删掉那两行。

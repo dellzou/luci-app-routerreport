@@ -81,4 +81,4 @@ echo "== 5) 在路由器上安装 =="
 ssh router 'cd /tmp && rm -rf /tmp/luci-app-routerreport && mkdir -p /tmp/luci-app-routerreport && tar xzf /tmp/luci-app-routerreport.tgz -C /tmp/luci-app-routerreport && sh /tmp/luci-app-routerreport/install.sh'
 
 echo
-echo "部署结束。请在浏览器打开 http://192.168.100.1 -> 服务 -> 邮件日报"
+echo "部署结束。请在浏览器打开 http://<路由器IP> -> 服务 -> 邮件日报"
