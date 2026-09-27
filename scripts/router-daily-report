@@ -283,7 +283,7 @@ Date: $(date -R)
         <td class="card"><div class="cl">CPU 平均</div><div class="cv">${CPU_AVG}%</div><div class="cs">峰值 ${CPU_MAX}%</div></td>
         <td class="card"><div class="cl">内存平均</div><div class="cv">${MEM_AVG}%</div><div class="cs">峰值 ${MEM_MAX}%</div></td>
         <td class="card"><div class="cl">负载平均</div><div class="cv">${LOAD_AVG}</div><div class="cs">峰值 ${LOAD_MAX}</div></td>
-        <td class="card"><div class="cl">数据盘占用</div><div class="cv">${DISK_LAST}%</div><div class="cs">峰值 ${DISK_MAX}%</div></td>
+        <td class="card"><div class="cl">磁盘占用</div><div class="cv">${DISK_LAST}%</div><div class="cs">峰值 ${DISK_MAX}%</div></td>
       </tr>
     </table>
   </td></tr>
