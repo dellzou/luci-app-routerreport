@@ -5,20 +5,21 @@
 - 面向设备：Intel J6412 / iStoreOS 25.12.5（LuCI 26.253，apk 生态）
 - 交付形态：**纯文件应用**（无需 OpenWrt SDK、无需编译）；后续可选打包成 `.apk`
 - 依赖：`luci-base`、`luci-compat`（一般已随固件安装）、以及已有的 `/usr/bin/router-daily-report`
-- 版本：0.1.0（2026-09-26）
+- 版本：0.1.1（2026-09-27）
 
 ![邮件日报应用界面](https://xiaozou123.cn/wp-content/uploads/2026/09/istoreos-luci-email-daily-report-panel-scaled.png)
 
 > 实际渲染效果（本地用真实主题 CSS 复刻渲染，非示意图）。
 
-**配套的两个采集/发送脚本也在这个仓库的 [`scripts/`](scripts) 里**，本应用就是它们的"配置界面 + 触发器"：
+**配套的三个采集/发送/轮转脚本也在这个仓库的 [`scripts/`](scripts) 里**，本应用就是它们的"配置界面 + 触发器"：
 
 | 脚本 | 作用 | 调度 |
 |---|---|---|
-| `scripts/router-metrics` | 每 5 分钟采集流量、服务状态、日志异常计数，落 CSV | crontab `*/5 * * * *` |
+| `scripts/router-metrics` | 每 5 分钟采集流量、CPU/内存/负载、数据盘占用，落 CSV | crontab `*/5 * * * *` |
 | `scripts/router-daily-report` | 汇总前一天数据，渲染 HTML 邮件并发送（支持 `--dry-run` / `--date` / `--force`） | crontab 每天一次 |
+| `scripts/router-logarchive` | `messages` 日志真轮转 + gzip 归档 + 30 天清理（防日志无限增长） | crontab `0 */6 * * *` |
 
-**不装界面也能用**：只部署这两个脚本 + 配好 `/etc/msmtprc` 与 crontab，就是一个完整的"路由器邮件日报"系统；界面解决的是"改配置不用 SSH"。
+**不装界面也能用**：只部署这三个脚本 + 配好 `/etc/msmtprc` 与 crontab，就是一个完整的"路由器邮件日报"系统；界面解决的是"改配置不用 SSH"。
 
 ---
 
@@ -50,7 +51,8 @@ luci-app-routerreport/
 │   └── usr/share/rpcd/acl.d/luci-app-routerreport.json
 ├── scripts/                               ← 配套的业务脚本（不使用界面也需要它们）
 │   ├── router-metrics                     指标采集（cron 每 5 分钟）
-│   └── router-daily-report                日报生成与发送（cron 每天一次）
+│   ├── router-daily-report                日报生成与发送（cron 每天一次）
+│   └── router-logarchive                  messages 日志轮转 + 归档清理（cron 每 6 小时）
 ├── deploy.sh                             电脑侧一键部署（--check 只检查 / --install 真装）
 ├── install.sh                            路由器侧安装（备份 → 拷贝 → 迁移配置 → 清菜单缓存）
 ├── README.md · LICENSE · VERSION · .gitattributes
@@ -59,6 +61,14 @@ luci-app-routerreport/
 
 > `scripts/` 里是随仓库发布的副本；部署后实际运行位置是 `/usr/bin/`。
 > 截图直接用博客图床外链，仓库里不放二进制文件。
+
+### 三个脚本各自解决什么
+
+| 脚本 | 解决的问题 |
+|---|---|
+| `router-metrics` | 把"瞬时值"变成"时间序列"——每 5 分钟落一行 CSV，日报才能算平均值和峰值 |
+| `router-daily-report` | 读 CSV + 系统日志，渲染 HTML 邮件；**流量按字节累加、输出时才换算单位** |
+| `router-logarchive` | iStoreOS 配了 `log_file` 后日志**只追加不轮转**，单文件无限增长 → 真轮转 + gzip + 30 天清理 |
 
 ---
 
@@ -78,10 +88,47 @@ luci-app-routerreport/
 ```
 /etc/config/routerreport
 /usr/bin/router-report-apply                        (755)
+/usr/bin/router-daily-report                        (755)
+/usr/bin/router-metrics                             (755)
+/usr/bin/router-logarchive                          (755)
 /usr/lib/lua/luci/controller/routerreport.lua
 /usr/lib/lua/luci/view/routerreport/main.htm
 /usr/share/rpcd/acl.d/luci-app-routerreport.json
 ```
+
+---
+
+## 3.1 一个值得单独说的坑：流量为什么会显示 0
+
+这不是"统计错了"，是 **busybox awk 的 `%d` 只支持 32 位有符号整数**。
+
+| | |
+|---|---|
+| 32 位有符号整数上限 | `2,147,483,647` ≈ 2.1 GB |
+| 一次 4 小时满速下载（2000M 宽带） | 约 2.5 TB |
+| 用 `printf "%d"` 输出 2,496,773,389,155 | 截断成 `-2147483648` |
+| 脚本的"负数保护"再把负值归零 | → 日报显示 `0 B` |
+
+awk 的**数值本身**是 IEEE754 双精度浮点，能精确表示到 `2^53` ≈ 9 PB，问题只出在**输出格式**上。
+
+```sh
+# ❌ 错：超过 2.1 GB 就溢出
+END{ printf "%d %d", srx, stx }
+
+# ✅ 对：双精度输出，9 PB 以内无损
+END{ printf "%.0f %.0f", srx, stx }
+```
+
+同理，shell 的 `$(( ))` 在 32 位 busybox 上也是整数运算，**合计流量必须用 awk 加**：
+
+```sh
+TRAF_TOTAL=$(awk -v a="$TRAF_DOWN" -v b="$TRAF_UP" 'BEGIN{ printf "%.0f", a+b }')
+```
+
+> 顺带一提：`router-metrics` 落盘的是**裸字节数**（不做单位换算，保证精度），
+> 所以任何读这张 CSV 的脚本都要遵守同一条规则 —— 该文件头上写了警告注释。
+>
+> **单位策略**：内部一律按字节累加，只在渲染邮件时才换算成 KB/MB/GB/TB。
 
 ---
 
@@ -130,6 +177,9 @@ rm -f  /usr/lib/lua/luci/controller/routerreport.lua
 rm -rf /usr/lib/lua/luci/view/routerreport
 rm -f  /usr/share/rpcd/acl.d/luci-app-routerreport.json
 rm -f  /tmp/luci-indexcache*
+# 可选：连配套脚本与它们的 cron 一起撤掉
+rm -f  /usr/bin/router-daily-report /usr/bin/router-metrics /usr/bin/router-logarchive
+sed -i '/router-logarchive/d' /etc/crontabs/root && /etc/init.d/cron restart
 ```
 
 `/etc/config/routerreport` 可保留（不装应用就没人读它）；想彻底清干净就一并删掉。crontab 与 `msmtprc` 会被保留成卸载前的最后状态。
@@ -145,7 +195,7 @@ rm -f  /tmp/luci-indexcache*
 
 ---
 
-## 8. 验证状态（2026-09-26 实测）
+## 8. 验证状态（2026-09-27 复测）
 
 | 项目 | 状态 |
 |---|---|
@@ -158,6 +208,9 @@ rm -f  /tmp/luci-indexcache*
 | `msmtprc` 功能行与安装前**逐行一致**（仅注释头不同） | ✅ |
 | 告警阈值生效：阈值调大后正文里"N 条需关注"条目消失 | ✅ |
 | 业务链路未被波及（`router-report.conf` / `msmtprc` / crontab 在安装瞬间均未变） | ✅ |
+| **流量大数不溢出**：实测 2,496,773,389,155 字节 → 日报正确显示 `2.27 TB` | ✅ |
+| **日志轮转**：`messages` ≥ 8 MB 触发 copytruncate + gzip，日报仍能读到 `messages` + `messages.old` | ✅ |
+| **磁盘监控**：日报"数据盘占用"格与 ≥85% 告警逻辑 | ✅ |
 | 浏览器实际渲染 + 四个按钮点击 | ⏳ **需登录 LuCI 人工过一遍**（无会话时脚本无法代测） |
 
 > 已知的安装期踩坑（已修）：
@@ -184,10 +237,30 @@ rm -f  /tmp/luci-indexcache*
 
 | 日期 | 版本 | 说明 |
 |---|---|---|
+| 2026-09-27 | 0.1.1 | **修复流量显示 0**（busybox awk `%d` 32 位溢出 → 改 `%.0f`）；新增 `router-logarchive` 日志真轮转；指标新增 `disk_pct`；日报增加数据盘占用与 DNS 防护拦截统计；异常白名单扩充 |
 | 2026-09-26 | 0.1.0 | 首个版本：配置 + 测试发送 + 预览 + 补发；`router-daily-report` 增加 `WARN_THRESHOLD` 支持 |
 
 ---
 
-## 11. License
+## 11. 关于轻量
+
+三个脚本都是**一次性执行、跑完即退**的普通 POSIX shell，没有常驻进程、没有守护线程、不引入任何运行时（Python/Node/Perl 都不需要，只用 busybox 自带的 `awk`/`sed`/`grep`/`df`）。
+
+| 指标 | 实测 |
+|---|---|
+| 单次采集耗时 | ~0.02 s |
+| 单次日志轮转耗时 | ~1.00 s |
+| 日报生成（3.8 MB 日志） | 近瞬时 |
+| 连续 30 次采集的内存增量 | +3.4 MB（页缓存，非泄漏），无累积 |
+| 日志轮转后稳态占用 | < 50 MB |
+
+设计上刻意规避了两类"监控工具常见病"：
+
+1. **内存泄漏** —— 不写常驻循环，自然没有长生命周期的累积；`router-metrics` 每次执行都是全新进程。
+2. **日志风暴** —— `router-logarchive` 负责轮转与压缩，`msmtp.log` 超 400 行自动收敛到 120 行，归档 30 天自动清理。**监控本身不会成为磁盘杀手。**
+
+---
+
+## 12. License
 
 MIT License —— 见 [LICENSE](LICENSE)。

@@ -71,6 +71,8 @@ STAGE=/tmp/.rr-stage.$$
 rm -rf "$STAGE"; mkdir -p "$STAGE/payload/usr/bin"
 cp -r "$DIR/root" "$DIR/install.sh" "$STAGE/"
 cp "$SH_REPORT" "$STAGE/payload/usr/bin/router-daily-report"
+cp "$DIR/scripts/router-metrics"    "$STAGE/payload/usr/bin/router-metrics"
+cp "$DIR/scripts/router-logarchive" "$STAGE/payload/usr/bin/router-logarchive"
 tar czf "$TARBALL" -C "$STAGE" .
 rm -rf "$STAGE"
 echo "   包大小：$(wc -c < "$TARBALL") 字节"

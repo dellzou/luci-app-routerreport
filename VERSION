@@ -1,16 +1,22 @@
-0.1.0 (2026-09-26)
+0.1.1 (2026-09-27)
 
 target : iStoreOS 25.12.5 (x86_64, apk) / LuCI 26.253 + luci-compat
-form   : 纯文件 LuCI 应用（免 SDK 免编译）+ 两个 POSIX shell 脚本
+form   : 纯文件 LuCI 应用（免 SDK 免编译）+ 三个 POSIX shell 脚本
+
+v0.1.1 变更：
+  - [修复] 日报流量显示 0：busybox awk 的 %d 是 32 位有符号整数（上限 2.1GB），
+           2000M 宽带数小时下载即溢出成负数。改用 %.0f（IEEE754 双精度，到 2^53≈9PB）。
+  - [新增] scripts/router-logarchive：messages 真轮转（copytruncate + gzip + 30 天清理）
+  - [新增] 指标新增 disk_pct 列（CSV 变 8 列，旧数据自动兼容）
+  - [新增] 日报增加"数据盘占用"与 DNS 防护拦截统计；磁盘 ≥85% 触发告警
+  - [优化] 异常白名单扩充（nmbd 选举噪音 / AGH dnsproxy / uhttpd Broken pipe）
+  - [安全] 流量累加与合计全部改浮点，杜绝任何 32 位溢出面
 
 verified on device:
-  - 静态检查（shell / JSON / Lua 控制器 / 模板内嵌 Lua）
+  - 上述全部脚本在 iStoreOS 25.12.5 上实跑通过（日报 --dry-run 输出 2.27 TB / 46.89 GB）
+  - shell / JSON / Lua 控制器 / 模板内嵌 Lua 静态检查
   - 控制器在真实 LuCI Lua 环境可加载
-  - 模板数据层 9 字段读取正确
-  - UCI 解析自检 + 首次安装迁移现有配置
   - 渲染脚本幂等（连跑两次第二次报 unchanged）
   - crontab 单行、无标记累积、时间格式正确
-  - 生成的 msmtprc 与手工配置逐行一致
-  - 告警阈值生效（调大后正文条目消失）
-  - 打桩直调 action_api：save(幂等/非法输入)、send(成功/非法日期)、status 全部返回合法 JSON
   - 权限：/etc/config/routerreport 与 /etc/msmtprc 均为 600
+  - 内存：三个脚本均非驻留，cron 触发即退，30 次采集无累积增长

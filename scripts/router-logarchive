@@ -1,0 +1,69 @@
+#!/bin/sh
+# router-logarchive —— messages 日志轮转 + 归档清理
+#
+# 背景（2026-09-27 排查）：
+#   iStoreOS 的 logd 只把日志放在内存环形缓冲（system.@system[0].log_size，本例 4096 KB），
+#   一旦配置了 log_file，日志会**持续追加写入该文件且永不轮转** ——
+#   log_size 对磁盘上的 messages 完全无效。单文件会无限增长，
+#   最终拖慢 grep 分析、撑大备份、并让内核日志丢失真正的时间线索。
+#   本脚本补上真正的轮转。
+#
+# 轮转设计（与 router-daily-report 配合）：
+#   · 采用 messages → messages.old → archive/ 两级滚动，**日报已经同时读这两个文件**，
+#     所以轮转不会让日报漏掉数据。
+#   · copytruncate 式（先 cp 再 : > 截断）：不能用 mv，因为 logd 持有原 fd，
+#     mv 后新文件收不到日志；截断则 inode 不变，logd 继续正常写入。
+#   · 仅当 messages ≥ MAX_SIZE 才轮转，避免产生大量碎文件。
+#   · 为保证日报的「昨日完整覆盖」，MAX_SIZE 设为约 2 天日志量（实测 ~3MB/天 → 8MB）；
+#     即轮转后 messages.old 仍保有轮转前的全部内容，日报取 messages + messages.old 足够覆盖昨日。
+#
+# 生成：WorkBuddy  2026-09-26 / 2026-09-27 改为真轮转
+
+LOGDIR=/mnt/data/logs
+ARC=$LOGDIR/archive
+MSG=$LOGDIR/messages
+OLD=$LOGDIR/messages.old
+MAX_SIZE=$(( 8 * 1024 * 1024 ))   # 8 MB 触发（约 2 天日志，保证日报覆盖昨日）
+KEEP_DAYS=30
+
+mkdir -p "$ARC"
+
+# ---------- 1. 主日志轮转（copytruncate，两级滚动） ----------
+if [ -s "$MSG" ]; then
+	SZ=$(wc -c < "$MSG" | tr -dc 0-9)
+	[ -n "$SZ" ] || SZ=0
+	if [ "$SZ" -ge "$MAX_SIZE" ]; then
+		STAMP=$(date +%Y%m%d-%H%M)
+		DEST="$ARC/messages-$STAMP.log"
+		# 先归档一份带时间戳的（供长期追溯）
+		if cp "$MSG" "$DEST" 2>/dev/null; then
+			# 再滚动：旧的 messages.old 丢弃（archive 里已有），messages → messages.old
+			[ -s "$MSG" ] && mv "$MSG" "$OLD" 2>/dev/null
+			: > "$MSG" 2>/dev/null
+			logger -t router-logarchive "messages 已轮转: $DEST ($((SZ/1024)) KB)"
+			gzip -9 "$DEST" 2>/dev/null
+		fi
+	fi
+fi
+
+# ---------- 2. 归档清理 ----------
+find "$ARC" -name "messages-*.log"    -mtime +$KEEP_DAYS -delete 2>/dev/null
+find "$ARC" -name "messages-*.log.gz" -mtime +$KEEP_DAYS -delete 2>/dev/null
+find "$ARC" -name "dmesg-*.log"       -mtime +$KEEP_DAYS -delete 2>/dev/null
+find "$ARC" -name "dmesg-*.log.gz"    -mtime +$KEEP_DAYS -delete 2>/dev/null
+
+# ---------- 3. 其他日志收敛 ----------
+# msmtp（只需最近记录，定位发信问题用）
+MLOG=$LOGDIR/msmtp.log
+if [ -f "$MLOG" ]; then
+	NL=$(wc -l < "$MLOG" | tr -d ' ')
+	[ "${NL:-0}" -gt 400 ] && { tail -n 120 "$MLOG" > "$MLOG.tmp" && mv "$MLOG.tmp" "$MLOG"; }
+fi
+
+# 遗留 pcap（DNS 观测已完成，超 7 天清理）
+for f in "$ARC"/*.pcap; do
+	[ -f "$f" ] || continue
+	[ -n "$(find "$f" -mtime +7 2>/dev/null)" ] && rm -f "$f" 2>/dev/null
+done
+
+exit 0

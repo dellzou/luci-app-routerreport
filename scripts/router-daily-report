@@ -63,11 +63,34 @@ grep -h ",$NEXT_DAY " "$DIR"/metrics-*.csv 2>/dev/null | sort -t, -k1,1n | head 
 CNT=$(grep -hc ",$YDAY " "$DIR"/metrics-*.csv 2>/dev/null | awk '{s+=$1}END{print s+0}' | tr -dc 0-9)
 SAMPLE_N=${CNT:-0}
 
-set -- $(awk -F, 'NR==1{prx=$3;ptx=$4;next}{drx=$3-prx;dtx=$4-ptx;if(drx>0)srx+=drx;if(dtx>0)stx+=dtx;prx=$3;ptx=$4}END{printf "%d %d", srx+0, stx+0}' "$TMP.samples" 2>/dev/null)
-TRAF_DOWN=${1:-0}; TRAF_UP=${2:-0}
+# 流量 = 相邻采样点字节计数的「正增长」累加。
+#
+# ⚠️ 关键：必须用 %.0f 输出，绝不能用 %d。
+#    busybox awk 的 %d 是 32 位有符号整数（上限 2,147,483,647 ≈ 2.1 GB）。
+#    本机为 2000M 宽带，一次 4 小时满速下载可达 2.8 TB，远超该上限，
+#    会被截断成 -2147483648，脚本再做负数保护 → 日报显示 0 B。
+#    awk 的数值本身是 IEEE754 双精度浮点，可精确表示到 2^53 ≈ 9 PB，用 %.0f 输出即无损。
+#    （2026-09-27 实测：2,496,773,389,155 用 %d 得 -2147483648，用 %.0f 得原值）
+#
+# 单位策略：内部按「字节」累加保留精度，仅在输出时换算。为避免大数继续流入下游，
+#   同时输出字节数与 MB 数，邮件正文一律使用 MB/GB。
+set -- $(awk -F, 'NR==1{prx=$3;ptx=$4;next}{
+	drx=$3-prx; dtx=$4-ptx;
+	if(drx>0) srx+=drx;
+	if(dtx>0) stx+=dtx;
+	prx=$3; ptx=$4
+}END{printf "%.0f %.0f", srx+0, stx+0}' "$TMP.samples" 2>/dev/null)
+TRAF_DOWN=$(printf '%.0f' "${1:-0}" 2>/dev/null); TRAF_DOWN=${TRAF_DOWN:-0}
+TRAF_UP=$(printf '%.0f' "${2:-0}" 2>/dev/null);   TRAF_UP=${TRAF_UP:-0}
 
-set -- $(awk -F, '{n++;c+=$5;m+=$6;l+=$7;if($7>lm)lm=$7;if($5>cm)cm=$5;if($6>mm)mm=$6}END{if(n>0)printf "%.1f %.1f %.2f %.2f %d %d",c/n,m/n,l/n,lm+0,cm+0,mm+0; else printf "0 0 0 0 0 0"}' "$TMP.samples" 2>/dev/null)
+# CPU/内存/负载（第 5/6/7 列）+ 磁盘（第 8 列，2026-09-27 起才有，旧数据为空需兼容）
+set -- $(awk -F, '{n++;c+=$5;m+=$6;l+=$7;if($7>lm)lm=$7;if($5>cm)cm=$5;if($6>mm)mm=$6;
+	if(NF>=8 && $8!=""){ d++; if($8>dm)dm=$8; if(d==1)df=$8; dl=$8 }
+}
+END{ if(n>0) printf "%.1f %.1f %.2f %.2f %.0f %.0f %.0f %.0f", c/n, m/n, l/n, lm+0, cm+0, mm+0, dl+0, dm+0;
+     else printf "0 0 0 0 0 0 0 0" }' "$TMP.samples" 2>/dev/null)
 CPU_AVG=${1:-0}; MEM_AVG=${2:-0}; LOAD_AVG=${3:-0}; LOAD_MAX=${4:-0}; CPU_MAX=${5:-0}; MEM_MAX=${6:-0}
+DISK_LAST=${7:-0}; DISK_MAX=${8:-0}
 
 COVERAGE=$(( SAMPLE_N * 100 / 288 ))
 [ "$COVERAGE" -gt 100 ] && COVERAGE=100
@@ -84,7 +107,9 @@ human() {
 }
 HUM_DOWN=$(human "$TRAF_DOWN")
 HUM_UP=$(human "$TRAF_UP")
-HUM_TOTAL=$(human $(( TRAF_DOWN + TRAF_UP )))
+# 合计用 awk 相加（双精度浮点），避免 shell 整数运算在大流量下溢出成负数
+TRAF_TOTAL=$(awk -v a="$TRAF_DOWN" -v b="$TRAF_UP" 'BEGIN{ printf "%.0f", a+b }')
+HUM_TOTAL=$(human "${TRAF_TOTAL:-0}")
 
 # ---------- 3. 日志异常分析 ----------
 {
@@ -105,11 +130,20 @@ CNT=$(wc -l < "$TMP.err" 2>/dev/null | tr -dc 0-9); ERR_N=${CNT:-0}
 NOISE='DEVICE-MAPPER|PROCFILE: Cannot open|Cannot read directory .*/proc/spl|Cannot refresh interface .* carrier state|Cannot read NUMA node directory|Cannot read ECC memory errors directory|plugins\.d/(perf|ioping)\.plugin|Failed to remove PCP mapping|send_batch|INTERNAL ERROR: indexing of section|This agent doesn.t have ACLK|Cannot get my current process scheduling policy|Cannot adjust netdata scheduling policy|POLLFD: LISTENER|child pid [0-9]+ exited with code 1|can.t open .*/proc/sys/oaf/|linkease app gateway listening|crond\[[0-9]+\]: (USER root pid|crond \(busybox)|backend ready'
 # ② 配置类噪音：AdGuard 把反查域转给 dnsmasq(5353)，而它只应答本地网段、其余空等 20s 超时
 #    （AGH 为 parallel 模式，超时不阻断解析，属设计冗余）
-CONFNOISE='dnsproxy: .*(127\.0\.0\.1:5353|in-addr\.arpa|ip6\.arpa)'
+#    + nmbd 的 NetBIOS 命名选举打架（局域网多台设备抢 WORKGROUP<1d>，低危常态）
+#    + AGH 的 DoH 上游交换提示（doh.pub 429 限流的伴生日志，AGH 自动回退）
+CONFNOISE='dnsproxy: .*(127\.0\.0\.1:5353|in-addr\.arpa|ip6\.arpa)|nmbd\[[0-9]+\]:|nmbd: *(query_name_response|This response was from IP|validate_nmb_packet)|dnsproxy: response received upstream_type=|uhttpd\[[0-9]+\]: .*Broken pipe'
 # ③ mihomo DNS 被拒 —— 不进噪音、保留在「需关注」：它反映代理链路是否中断过（重启/停止期间会出现）
 MIHOMO_PTR='dnsproxy: .*127\.0\.0\.1:7874'
 
 grep -vE "$NOISE" "$TMP.err" 2>/dev/null | grep -vE "$CONFNOISE" > "$TMP.real"
+
+# ④ DNSguard 观测打点 —— 设计行为，不是故障：
+#    dns_guard_pre_forward 链对「内网直连外部 DNS(53/853)」和「直连已知 DoH 服务器(443)」做
+#    计数 + 抽样记日志（limit rate 见 /etc/config/dnsguard 的 log_limit），用于观察哪台设备在绕过防护。
+#    它属 kern.warn 但**不会**被上面的 ERRPAT 命中（模式要求 "warning " 全拼 + 空格，日志是 "kern.warn"），
+#    因此既不进「需关注」也不进噪音白名单，原先等于被完全忽略。这里改为单独统计、单独展示。
+BYPASS_N=$(grep -cE 'DNS-BYPASS-(53853|DOH):' "$TMP.log" 2>/dev/null | tr -dc 0-9); BYPASS_N=${BYPASS_N:-0}
 
 # 计数统一走 tr -dc 0-9 + 默认值，避免空值/多行把 test 打崩（busybox test 对非数字报 out of range）
 CNT=$(wc -l < "$TMP.real" 2>/dev/null | tr -dc 0-9);        REAL_N=${CNT:-0}
@@ -170,6 +204,7 @@ ISSUES=""
 [ "$REAL_N" -ge "$WARN_THRESHOLD" ] && ISSUES="$ISSUES<li>发现 <b>$REAL_N</b> 条需关注的错误日志</li>"
 [ "$SVC_DOWN" -gt 0 ] && ISSUES="$ISSUES<li>有 <b>$SVC_DOWN</b> 个关键服务未运行</li>"
 [ "$COVERAGE" -lt 90 ] && ISSUES="$ISSUES<li>数据覆盖率仅 <b>$COVERAGE%</b>，期间可能发生过重启或断电</li>"
+[ "$DISK_LAST" -ge 85 ] && ISSUES="$ISSUES<li>数据盘占用已达 <b>${DISK_LAST}%</b>，请清理 /mnt/data 下的日志或数据</li>"
 echo "$BOOT_NOTE" | grep -q "异常" && ISSUES="$ISSUES<li>开机记录显示上次为异常关机</li>"
 
 if [ -n "$ISSUES" ]; then
@@ -184,16 +219,22 @@ fi
 #    4 条提示挤在一行约 1089 字节 → 服务器直接回 "500 Line too long" 拒收（2026-09-26 实测踩坑）
 TIP=""
 [ "$CONF_N" -gt 0 ] && TIP="$TIP
-<li><b>AdGuard 反查噪音 $CONF_N 条</b>：<code>in-addr.arpa</code> / <code>ip6.arpa</code> 被转给 dnsmasq(5353)，而它只应答本地网段、其余空等 20 秒超时（AGH 为 parallel 模式，不阻断解析，属设计冗余）。</li>"
+<li><b>配置类噪音 $CONF_N 条</b>（已归类，无需处理）：① AdGuard 把反查域 <code>in-addr.arpa</code> / <code>ip6.arpa</code> 转给 dnsmasq(5353)，而它只应答本地网段、其余空等 20 秒超时；② Samba <code>nmbd</code> 的 NetBIOS 命名选举打架（局域网有多台设备声称同一 WORKGROUP 主浏览器，通常 NAS 也开了 Samba，只影响网上邻居浏览）；③ AGH 在 DoH 上游交换数据时打的 <code>[error]</code> 级提示（配合 <code>doh.pub</code> 限流，会自动回退）。</li>"
 [ "$MIHOMO_N" -gt 0 ] && TIP="$TIP
 <li>需关注项中有 $MIHOMO_N 条是 mihomo DNS（<code>127.0.0.1:7874</code>）连接被拒，通常出现在 netflow/mihomo 重启或停止期间；AGH 为 parallel 模式会由 DoH 自动接管、DNS 不中断。若该数字持续增长，说明代理链路异常，需检查 mihomo 进程。</li>"
 [ "$NOISE_N" -gt 0 ] && TIP="$TIP
 <li>另有 $NOISE_N 条组件自检噪音（netdata 探测虚拟设备/虚拟网卡、perf/ioping 插件缺依赖、UPnP 映射热更新竞态、oaf 内核模块未加载等），已自动归类，无需处理。</li>"
 [ "$LIMIT_N" -gt 0 ] && TIP="$TIP
 <li>需关注项中有 $LIMIT_N 条是腾讯 DoH（<code>doh.pub</code>）返回 <b>429 限流</b>，AdGuard 会自动回退到其他上游，不影响正常解析；若持续增多，建议调整 AGH 上游权重或增补上游。</li>"
+[ "$BYPASS_N" -gt 0 ] && TIP="$TIP
+<li>DNS 防护拦截尝试 <b>$BYPASS_N</b> 次：内网设备试图直连外部 DNS(53/853) 或已知 DoH 服务器(443)，已被透明重定向到 AdGuard。属正常观测，说明防护在按预期工作；数量突增时可排查是哪台设备在绕过。</li>"
 
 # ---------- 7. 组装邮件 ----------
 if [ "$COVERAGE" -ge 95 ]; then DATA_NOTE="数据完整"; else DATA_NOTE="数据覆盖 $COVERAGE%（$SAMPLE_N / 288 个采样点）"; fi
+
+# 流量卡片下方的一行小字：仅在采样有断档时说明，平时不打扰
+TRAF_NOTE=""
+[ "$COVERAGE" -lt 95 ] && TRAF_NOTE="<div class=\"cs\" style=\"padding:6px 2px 0;\">采样完整度 $COVERAGE%，断档时段的流量无法计入</div>"
 
 SUBJECT="[$ROUTER_NAME] $YDAY 日报 $VERDICT_ICON $VERDICT_TEXT"
 SUBJ_B64=$(printf '%s' "$SUBJECT" | openssl base64 -A)
@@ -232,6 +273,7 @@ Date: $(date -R)
         <td class="card"><div class="cl">合计</div><div class="cv">$HUM_TOTAL</div></td>
       </tr>
     </table>
+    $TRAF_NOTE
   </td></tr>
 
   <tr><td style="padding:14px 26px 0;">
@@ -241,6 +283,7 @@ Date: $(date -R)
         <td class="card"><div class="cl">CPU 平均</div><div class="cv">${CPU_AVG}%</div><div class="cs">峰值 ${CPU_MAX}%</div></td>
         <td class="card"><div class="cl">内存平均</div><div class="cv">${MEM_AVG}%</div><div class="cs">峰值 ${MEM_MAX}%</div></td>
         <td class="card"><div class="cl">负载平均</div><div class="cv">${LOAD_AVG}</div><div class="cs">峰值 ${LOAD_MAX}</div></td>
+        <td class="card"><div class="cl">数据盘占用</div><div class="cv">${DISK_LAST}%</div><div class="cs">峰值 ${DISK_MAX}%</div></td>
       </tr>
     </table>
   </td></tr>
@@ -250,6 +293,7 @@ Date: $(date -R)
     <table width="100%" cellpadding="0" cellspacing="0" role="presentation" class="kv">
       <tr><td class="k">昨日日志总量</td><td class="v">$TOTAL_LOG 行</td></tr>
       <tr><td class="k">需关注错误</td><td class="v">$([ "$REAL_N" -gt 0 ] && echo "<span class=\"bad\">$REAL_N 条</span>" || echo "<span class=\"ok\">0 条</span>")</td></tr>
+      <tr><td class="k">DNS 防护拦截尝试</td><td class="v">$BYPASS_N 次（内网设备直连外部 DNS/DoT，属正常观测）</td></tr>
       <tr><td class="k">已知无害噪音</td><td class="v">$NOISE_N 条（组件自检，已归类）</td></tr>
       <tr><td class="k">配置类噪音</td><td class="v">$CONF_N 条（反查域冗余上游，已归类）</td></tr>
       <tr><td class="k">开关机情况</td><td class="v">$BOOT_NOTE</td></tr>

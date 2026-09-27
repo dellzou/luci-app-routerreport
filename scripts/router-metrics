@@ -1,21 +1,26 @@
 #!/bin/sh
 # router-metrics —— 系统指标采集器（每 5 分钟一次）
-# 作用：为每日报告提供 CPU / 内存 / 负载 / WAN 流量的时间序列数据
+# 作用：为每日报告提供 CPU / 内存 / 负载 / WAN 流量 / 磁盘占用的时间序列数据
 # 数据：/mnt/data/sysreport/metrics-YYYY-MM.csv
-# 列  ：epoch,time,wan_rx,wan_tx,cpu_pct,mem_pct,load1
+# 列  ：epoch,time,wan_rx,wan_tx,cpu_pct,mem_pct,load1,disk_pct
 # 口径：wan = 物理 WAN 口 eth0 累计字节（PPPoE 重拨不清零，仅路由器重启清零）
-# 生成：WorkBuddy  2026-09-26
+#       disk_pct = /mnt/data 分区已用百分比（用于观察日志/数据增长趋势，防磁盘写满）
+# ⚠️ wan_rx/wan_tx 是「裸字节数」，已可能达到 TB 量级（2000M 宽带一天可达数 TB）。
+#    任何读取本文件的脚本，累加/输出时都不得使用 awk 的 %d（32 位，上限 2.1GB），
+#    必须用 %.0f（IEEE754 双精度，精确到 2^53 ≈ 9PB）。参见 router-daily-report。
+# 生成：WorkBuddy  2026-09-26（2026-09-27 增加 disk_pct 列）
 
 DIR=/mnt/data/sysreport
 IFACE=eth0
+DATADIR=/mnt/data
 KEEP_DAYS=400
 MLOG=/mnt/data/logs/msmtp.log
 
 [ -d "$DIR" ] || mkdir -p "$DIR"
 FILE="$DIR/metrics-$(date +%Y-%m).csv"
-[ -s "$FILE" ] || echo "epoch,time,wan_rx,wan_tx,cpu_pct,mem_pct,load1" > "$FILE"
+[ -s "$FILE" ] || echo "epoch,time,wan_rx,wan_tx,cpu_pct,mem_pct,load1,disk_pct" > "$FILE"
 
-# ---------- 1. WAN 累计字节 ----------
+# ---------- 1. WAN 累计字节（裸字节，不做单位换算以保留精度） ----------
 eval "$(awk -v i="$IFACE:" '$1==i {print "RX="$2"; TX="$10}' /proc/net/dev)"
 [ -n "$RX" ] || RX=0
 [ -n "$TX" ] || TX=0
@@ -42,9 +47,16 @@ MEM=0
 # ---------- 4. 负载 ----------
 LOAD=$(cut -d' ' -f1 /proc/loadavg)
 
-echo "$(date +%s),$(date '+%Y-%m-%d %H:%M'),$RX,$TX,$CPU,$MEM,$LOAD" >> "$FILE"
+# ---------- 5. 磁盘占用（/mnt/data 已用百分比，用于发现日志/数据异常膨胀） ----------
+DISK=$(df "$DATADIR" 2>/dev/null | awk 'NR==2{gsub(/%/,"",$5); print $5}')
+DISK=$(echo "$DISK" | tr -dc 0-9)
+[ -n "$DISK" ] || DISK=0
 
-# ---------- 5. 维护：清理过期数据、收敛 msmtp 日志 ----------
+echo "$(date +%s),$(date '+%Y-%m-%d %H:%M'),$RX,$TX,$CPU,$MEM,$LOAD,$DISK" >> "$FILE"
+
+# ---------- 6. 维护：清理过期数据、收敛 msmtp 日志 ----------
+# 注意：日志轮转由 /usr/bin/router-logarchive（cron 0 */6）负责，本脚本不再重复处理，
+#       避免两处逻辑互相干扰。此处的 find 只作用于 sysreport 目录内的 CSV。
 find "$DIR" -name 'metrics-*.csv' -mtime +$KEEP_DAYS -exec rm -f {} \; 2>/dev/null
 if [ -f "$MLOG" ]; then
 	NL=$(wc -l < "$MLOG" | tr -d ' ')

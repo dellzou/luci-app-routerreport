@@ -14,4 +14,5 @@
 *.htm    text eol=lf
 router-metrics      text eol=lf
 router-daily-report text eol=lf
+router-logarchive   text eol=lf
 router-report-apply text eol=lf

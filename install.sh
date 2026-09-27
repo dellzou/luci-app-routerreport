@@ -33,6 +33,31 @@ for f in $FILES; do
 done
 echo "已备份旧文件 -> $BAK"
 
+# ---------- 1b. 配套脚本（metrics / logarchive）----------
+# 这两个不参与 UCI 配置，只保证"随包升级"；已存在且更新则备份后覆盖。
+for s in router-metrics router-logarchive; do
+	if [ -f "/tmp/luci-app-routerreport/payload/usr/bin/$s" ]; then
+		if [ -f "/usr/bin/$s" ] && ! cmp -s "/tmp/luci-app-routerreport/payload/usr/bin/$s" "/usr/bin/$s"; then
+			mkdir -p "$BAK/usr/bin"
+			cp "/usr/bin/$s" "$BAK/usr/bin/$s"
+		fi
+		cp "/tmp/luci-app-routerreport/payload/usr/bin/$s" "/usr/bin/$s"
+		chmod 755 "/usr/bin/$s"
+		echo "已安装 /usr/bin/$s"
+	fi
+done
+
+# cron：router-logarchive 每 6 小时轮转一次日志（幂等，已存在则不动）
+if [ -x /usr/bin/router-logarchive ]; then
+	if ! grep -q '/usr/bin/router-logarchive' /etc/crontabs/root 2>/dev/null; then
+		echo "0 */6 * * * /usr/bin/router-logarchive" >> /etc/crontabs/root
+		/etc/init.d/cron restart >/dev/null 2>&1 || /etc/init.d/cron reload >/dev/null 2>&1
+		echo "已加入 cron：router-logarchive（0 */6 * * *）"
+	else
+		echo "cron 已有 router-logarchive，跳过"
+	fi
+fi
+
 # ---------- 2. 拷文件 ----------
 if [ -f /etc/config/routerreport ]; then
 	echo "已存在 /etc/config/routerreport —— 保留不动（你的配置不会被覆盖）"
