@@ -11,6 +11,9 @@ v0.1.1 变更：
   - [新增] 日报增加"数据盘占用"与 DNS 防护拦截统计；磁盘 ≥85% 触发告警
   - [优化] 异常白名单扩充（nmbd 选举噪音 / AGH dnsproxy / uhttpd Broken pipe）
   - [安全] 流量累加与合计全部改浮点，杜绝任何 32 位溢出面
+  - [修复] 卡片布局：.card 原写死 width:33%（按 3 格设计），加第 4 格后总宽 132%
+           被压缩，导致"数据盘占用"标签被挤成竖排。改为不写死宽度按列均分，
+           并给 .cl/.cs 加 white-space:nowrap
 
 verified on device:
   - 上述全部脚本在 iStoreOS 25.12.5 上实跑通过（日报 --dry-run 输出 2.27 TB / 46.89 GB）

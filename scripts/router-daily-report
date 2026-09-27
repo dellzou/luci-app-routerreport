@@ -326,10 +326,12 @@ Date: $(date -R)
 <style>
   .h{font-size:13px;font-weight:600;color:#57606a;letter-spacing:.3px;padding-bottom:8px;border-bottom:1px solid #eaecef;}
   .grid{border-collapse:separate;border-spacing:8px 0;margin-top:10px;}
-  .card{background:#f6f8fa;border-radius:8px;padding:12px 14px;width:33%;}
-  .cl{font-size:12px;color:#57606a;}
+  /* 不写死 width：格子数会变（流量行 3 格 / 资源行 4 格），
+     写死 33% 会让 4 格总宽 132% 被压缩，标签被挤成竖排 */
+  .card{background:#f6f8fa;border-radius:8px;padding:12px 14px;}
+  .cl{font-size:12px;color:#57606a;white-space:nowrap;}
   .cv{font-size:19px;font-weight:600;margin-top:4px;color:#1f2328;}
-  .cs{font-size:11.5px;color:#8b949e;margin-top:3px;}
+  .cs{font-size:11.5px;color:#8b949e;margin-top:3px;white-space:nowrap;}
   .kv{width:100%;border-collapse:collapse;margin-top:8px;}
   .kv td{font-size:13px;padding:7px 0;border-bottom:1px solid #f0f2f4;}
   .kv .k{color:#57606a;}
